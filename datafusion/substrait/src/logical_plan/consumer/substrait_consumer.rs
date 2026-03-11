@@ -31,7 +31,7 @@ use datafusion::common::{
 };
 use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use substrait::proto;
 use substrait::proto::expression as substrait_expression;
 use substrait::proto::expression::{
@@ -249,6 +249,29 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
         from_exchange_rel(self, rel).await
     }
 
+    /// Handle a `ReferenceRel` which points to another relation tree by index.
+    /// The default implementation returns a not-implemented error.
+    /// Override this if your consumer supports multi-relation plans with ReferenceRel.
+    async fn consume_reference(
+        &self,
+        subtree_ordinal: i32,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        not_impl_err!(
+            "ReferenceRel with subtree_ordinal {} not supported",
+            subtree_ordinal
+        )
+    }
+
+    /// Store a resolved relation at the given index for later reference by `ReferenceRel`.
+    /// The default implementation is a no-op.
+    fn store_resolved_relation(
+        &self,
+        _index: usize,
+        _plan: &LogicalPlan,
+    ) -> datafusion::common::Result<()> {
+        Ok(())
+    }
+
     // Expression Methods
     // There is one method per Substrait expression to allow for easy overriding of consumer behaviour
     // These methods have default implementations calling the common handler code, to allow for users
@@ -437,11 +460,29 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
 pub struct DefaultSubstraitConsumer<'a> {
     pub(super) extensions: &'a Extensions,
     pub(super) state: &'a SessionState,
+    pub(super) resolved_relations: Arc<RwLock<Vec<Option<LogicalPlan>>>>,
 }
 
 impl<'a> DefaultSubstraitConsumer<'a> {
     pub fn new(extensions: &'a Extensions, state: &'a SessionState) -> Self {
-        DefaultSubstraitConsumer { extensions, state }
+        DefaultSubstraitConsumer {
+            extensions,
+            state,
+            resolved_relations: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Create a consumer pre-sized for a plan with `num_relations` relation trees.
+    pub fn with_plan_size(
+        extensions: &'a Extensions,
+        state: &'a SessionState,
+        num_relations: usize,
+    ) -> Self {
+        DefaultSubstraitConsumer {
+            extensions,
+            state,
+            resolved_relations: Arc::new(RwLock::new(vec![None; num_relations])),
+        }
     }
 }
 
@@ -463,6 +504,57 @@ impl SubstraitConsumer for DefaultSubstraitConsumer<'_> {
 
     fn get_function_registry(&self) -> &impl FunctionRegistry {
         self.state
+    }
+
+    async fn consume_reference(
+        &self,
+        subtree_ordinal: i32,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        let ordinal = usize::try_from(subtree_ordinal).map_err(|_| {
+            datafusion::common::DataFusionError::Substrait(format!(
+                "Invalid negative subtree_ordinal: {subtree_ordinal}"
+            ))
+        })?;
+        let relations = self.resolved_relations.read().map_err(|e| {
+            datafusion::common::DataFusionError::Substrait(format!(
+                "Failed to read resolved_relations: {e}"
+            ))
+        })?;
+        if ordinal >= relations.len() {
+            return substrait_err!(
+                "ReferenceRel subtree_ordinal {} is out of bounds (plan has {} relations)",
+                subtree_ordinal,
+                relations.len()
+            );
+        }
+        match &relations[ordinal] {
+            Some(plan) => Ok(plan.clone()),
+            None => substrait_err!(
+                "ReferenceRel subtree_ordinal {} refers to a relation that has not been resolved yet (forward references are not supported)",
+                subtree_ordinal
+            ),
+        }
+    }
+
+    fn store_resolved_relation(
+        &self,
+        index: usize,
+        plan: &LogicalPlan,
+    ) -> datafusion::common::Result<()> {
+        let mut relations = self.resolved_relations.write().map_err(|e| {
+            datafusion::common::DataFusionError::Substrait(format!(
+                "Failed to write resolved_relations: {e}"
+            ))
+        })?;
+        if index >= relations.len() {
+            return substrait_err!(
+                "Cannot store resolved relation at index {} (plan has {} relations)",
+                index,
+                relations.len()
+            );
+        }
+        relations[index] = Some(plan.clone());
+        Ok(())
     }
 
     async fn consume_extension_leaf(

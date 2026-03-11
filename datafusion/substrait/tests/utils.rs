@@ -256,7 +256,7 @@ pub mod test {
                     self.apply(c.left.as_ref().map(|b| b.as_ref()))?;
                     self.apply(c.right.as_ref().map(|b| b.as_ref()))?;
                 }
-                // RelType::Reference(_) => {}
+                RelType::Reference(_) => {}
                 // RelType::Write(_) => {}
                 // RelType::Ddl(_) => {}
                 RelType::HashJoin(j) => {

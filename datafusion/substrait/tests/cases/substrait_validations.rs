@@ -29,6 +29,8 @@ mod tests {
         use insta::assert_snapshot;
         use std::collections::HashMap;
         use std::sync::Arc;
+        use substrait::proto::rel::RelType;
+        use substrait::proto::{PlanRel, ReferenceRel, Rel, RelRoot, plan_rel};
 
         fn generate_context_with_table(
             table_name: &str,
@@ -148,6 +150,90 @@ mod tests {
                 generate_context_with_table("DATA", vec![("a", DataType::Date32, true)])?;
             let res = from_substrait_plan(&ctx.state(), &proto_plan).await;
             assert!(res.is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn consume_multi_relation_plan_with_reference() -> Result<()> {
+            let mut proto_plan =
+                read_json("tests/testdata/test_plans/simple_select.substrait.json");
+            let referenced_rel = proto_plan.relations[0].clone();
+
+            let reference_root = PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(Rel {
+                        rel_type: Some(RelType::Reference(ReferenceRel {
+                            subtree_ordinal: 0,
+                        })),
+                    }),
+                    names: vec!["a".to_string(), "b".to_string()],
+                })),
+            };
+            proto_plan.relations = vec![referenced_rel, reference_root];
+
+            let df_schema =
+                vec![("a", DataType::Int32, false), ("b", DataType::Int32, true)];
+            let ctx = generate_context_with_table("DATA", df_schema)?;
+            let plan = from_substrait_plan(&ctx.state(), &proto_plan).await?;
+
+            assert_snapshot!(
+            plan,
+            @r"
+            Projection: DATA.a, DATA.b
+              TableScan: DATA
+            "
+                        );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reject_reference_rel_with_out_of_bounds_ordinal() -> Result<()> {
+            let mut proto_plan =
+                read_json("tests/testdata/test_plans/simple_select.substrait.json");
+            let referenced_rel = proto_plan.relations[0].clone();
+
+            let reference_root = PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: Some(Rel {
+                        rel_type: Some(RelType::Reference(ReferenceRel {
+                            subtree_ordinal: 2,
+                        })),
+                    }),
+                    names: vec!["a".to_string(), "b".to_string()],
+                })),
+            };
+            proto_plan.relations = vec![referenced_rel, reference_root];
+
+            let df_schema =
+                vec![("a", DataType::Int32, false), ("b", DataType::Int32, true)];
+            let ctx = generate_context_with_table("DATA", df_schema)?;
+            let err = from_substrait_plan(&ctx.state(), &proto_plan)
+                .await
+                .expect_err("plan with invalid ReferenceRel must fail");
+
+            assert!(
+                err.to_string().contains("out of bounds"),
+                "unexpected error: {err}"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn consume_single_relation_plan_without_reference() -> Result<()> {
+            let proto_plan =
+                read_json("tests/testdata/test_plans/simple_select.substrait.json");
+            let df_schema =
+                vec![("a", DataType::Int32, false), ("b", DataType::Int32, true)];
+            let ctx = generate_context_with_table("DATA", df_schema)?;
+            let plan = from_substrait_plan(&ctx.state(), &proto_plan).await?;
+
+            assert_snapshot!(
+            plan,
+            @r"
+            Projection: DATA.a, DATA.b
+              TableScan: DATA
+            "
+                        );
             Ok(())
         }
     }

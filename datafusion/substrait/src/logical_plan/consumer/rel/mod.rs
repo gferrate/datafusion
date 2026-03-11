@@ -72,6 +72,11 @@ pub async fn from_substrait_rel(
                 consumer.consume_consistent_partition_window(rel).await
             }
             RelType::Exchange(rel) => consumer.consume_exchange(rel).await,
+            RelType::Reference(reference_rel) => {
+                consumer
+                    .consume_reference(reference_rel.subtree_ordinal)
+                    .await
+            }
             rt => not_impl_err!("{rt:?} rel not supported yet"),
         },
         None => return substrait_err!("rel must set rel_type"),
